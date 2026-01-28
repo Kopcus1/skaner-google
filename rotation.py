@@ -12,8 +12,11 @@ BASE_DIR = os.path.join(CURRENT_DIR, "content")
 
 # Folder ze zdjęciami od Skanera
 INPUT_DIR = os.path.join(BASE_DIR, "RAW_PHOTO")
-# Folder wynikowy (Wyprostowane + ID szablonu + Resize)
+# Folder wynikowy (Wyprostowane + Resize)
 OUTPUT_DIR = os.path.join(BASE_DIR, "CROPPED")
+
+# Folder zbiorczy (struktura katalogów)
+EXTRA_OUTPUT_ROOT = os.path.join(CURRENT_DIR, "full_content")
 
 # Archiwum i Błędy
 ARCHIVE_DIR = os.path.join(BASE_DIR, "ARCHIVE_RAW")
@@ -21,13 +24,13 @@ ERROR_DIR = os.path.join(BASE_DIR, "ERROR_RAW")
 
 VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp')
 
-# --- NOWOŚĆ: DOCELOWE WYMIARY ---
+# --- DOCELOWE WYMIARY ---
 FINAL_WIDTH = 486
 FINAL_HEIGHT = 727
 
 
 def setup_directories():
-    for path in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR, ERROR_DIR]:
+    for path in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR, ERROR_DIR, EXTRA_OUTPUT_ROOT]:
         if not os.path.exists(path):
             os.makedirs(path)
 
@@ -58,34 +61,23 @@ def estimate_missing_point(markers):
 
 
 def robust_qr_detect(img_path):
-    """
-    Super-stabilna detekcja.
-    Zmniejsza obraz do analizy (dla szybkości i redukcji szumu), znajduje punkty,
-    a potem przelicza je na oryginał.
-    """
     original_img = cv2.imread(img_path)
     if original_img is None: return None, None, None, None
 
     height, width = original_img.shape[:2]
-
-    # Skalowanie w dół do ok 1600px szerokości dla detektora
     target_width = 1600
     scale_factor = 1.0
     if width > target_width:
         scale_factor = target_width / width
 
-    # Tworzymy małą kopię do analizy
     if scale_factor < 1.0:
         small_img = cv2.resize(original_img, (0, 0), fx=scale_factor, fy=scale_factor)
     else:
         small_img = original_img.copy()
 
     detector = cv2.QRCodeDetector()
-
-    # Próba 1: Na (pomniejszonym) oryginale
     retval, decoded, points, _ = detector.detectAndDecodeMulti(small_img)
 
-    # Próba 2: Progowanie (czarno-białe)
     if not retval:
         gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
@@ -93,9 +85,7 @@ def robust_qr_detect(img_path):
 
     if retval and decoded:
         valid_count = sum(1 for info in decoded if info and "_" in info)
-
         if valid_count >= 3:
-            # Przeliczamy punkty z powrotem na oryginał
             real_points = points / scale_factor
             return True, decoded, real_points, original_img
 
@@ -117,10 +107,8 @@ def process_image(filename):
         if "_" in info:
             parts = info.split('_')
             pos = parts[0]
-
             if len(parts) > 1:
-                pattern_id = parts[1]
-                detected_ids.append(pattern_id)
+                detected_ids.append(parts[1])
 
             center_x = np.mean(points[i][:, 0])
             center_y = np.mean(points[i][:, 1])
@@ -142,7 +130,6 @@ def process_image(filename):
     try:
         src_pts = np.array([markers['TL'], markers['TR'], markers['BR'], markers['BL']], dtype="float32")
 
-        # Obliczamy dynamicznie wymiary wycinanego fragmentu (tylko do Warpu)
         width_a = distance(markers['TL'], markers['TR'])
         width_b = distance(markers['BL'], markers['BR'])
         max_width = max(int(width_a), int(width_b))
@@ -161,22 +148,32 @@ def process_image(filename):
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
         warped_img = cv2.warpPerspective(img, M, (max_width, max_height))
 
-        # 1. Rotacja
+        # 1. Rotacja i Resize
         warped_img = cv2.rotate(warped_img, cv2.ROTATE_90_CLOCKWISE)
-
-        # 2. --- NOWOŚĆ: WYMUSZONE SKALOWANIE ---
-        # Niezależnie od tego, co wyszło z warpu, ściskamy/rozciągamy do 486x727
         warped_img = cv2.resize(warped_img, (FINAL_WIDTH, FINAL_HEIGHT), interpolation=cv2.INTER_AREA)
 
-        output_filename = f"flat_p{final_pattern_id}_{filename}"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        # --- ZAPIS A: Folder CROPPED (Nazwa oryginalna) ---
+        output_filename = filename
+        output_path_cropped = os.path.join(OUTPUT_DIR, output_filename)
+        cv2.imwrite(output_path_cropped, warped_img)
 
-        cv2.imwrite(output_path, warped_img)
+        # --- ZAPIS B: Folder FULL_CONTENT (Nazwa "scan.jpg") ---
+        folder_name_only = os.path.splitext(filename)[0]  # Folder = nazwa pliku bez .jpg
+        file_extension = os.path.splitext(filename)[1]  # np. .jpg
 
-        info_extra = f"ID:{final_pattern_id} -> Resized:{FINAL_WIDTH}x{FINAL_HEIGHT}"
+        # Nazwa w podfolderze ZAWSZE "scan.jpg"
+        fixed_name = f"scan{file_extension}"
+
+        extra_dir_path = os.path.join(EXTRA_OUTPUT_ROOT, folder_name_only)
+        extra_file_path = os.path.join(extra_dir_path, fixed_name)
+
+        os.makedirs(extra_dir_path, exist_ok=True)
+        cv2.imwrite(extra_file_path, warped_img)
+
+        info_extra = f"ID:{final_pattern_id} -> Saved: CROPPED/{output_filename} & FULL/{folder_name_only}/{fixed_name}"
         if reconstructed_key: info_extra += f", Reco:{reconstructed_key}"
 
-        return True, f"OK [{info_extra}] -> {output_filename}"
+        return True, f"OK [{info_extra}]"
 
     except Exception as e:
         return False, f"Geometria blad: {e}"
@@ -184,8 +181,10 @@ def process_image(filename):
 
 def main_loop():
     setup_directories()
-    print("--- PROCESSOR DEWARP (RESIZE 486x727) START ---")
+    print("--- PROCESSOR DEWARP START ---")
     print(f"Watch: {INPUT_DIR}")
+    print(f"Target 1: {OUTPUT_DIR} (Original Name)")
+    print(f"Target 2: {EXTRA_OUTPUT_ROOT} (Name: scan.jpg)")
 
     while True:
         try:

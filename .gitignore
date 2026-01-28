@@ -14,6 +14,17 @@ __pycache__/
 pip-log.txt
 pip-delete-this-directory.txt
 
+# --- NODE.JS / ELECTRON (Frontend) ---
+node_modules/
+dist/
+build/
+out/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+.eslintcache
+.npm/
+
 # --- IDE (Ustawienia edytorów) ---
 .idea/
 .vscode/
@@ -38,6 +49,5 @@ Desktop.ini
 .DS_Store
 
 # --- WYJĄTKI (Opcjonalnie) ---
-# Jeśli chcesz, aby konkretny config json był w repozytorium, a inne jsony nie:
 # *.json
 # !full_map_config.json

@@ -1,44 +1,55 @@
 @echo off
-title System Wesola - LAUNCHER
+title System Wesola - LAUNCHER (FULL SUITE)
 
-:: Przejdź do folderu, w którym znajduje się ten skrypt
+:: Przejdz do folderu skryptu
 cd /d "%~dp0"
 
-echo ==========================================
-echo    START SYSTEMU "WESOLA" (Google Edition)
-echo ==========================================
+echo ========================================================
+echo   START SYSTEMU "WESOLA" (Electron + Python Scripts)
+echo ========================================================
 
-:: Sprawdzenie czy istnieje venv
+:: --- KROK 0: CZYSZCZENIE (Odblokowanie portow i kamery) ---
+echo [0/5] Zamykanie starych procesow...
+taskkill /F /IM python.exe >nul 2>&1
+taskkill /F /IM electron.exe >nul 2>&1
+taskkill /F /IM node.exe >nul 2>&1
+
+:: Sprawdzenie srodowiska
 if not exist ".venv\Scripts\python.exe" (
-    echo [BLAD] Nie znaleziono srodowiska wirtualnego .venv!
-    echo Upewnij sie, ze skrypt jest w folderze projektu.
+    echo [BLAD] Nie znaleziono .venv!
+    echo Upewnij sie, ze jestes w dobrym folderze.
     pause
     exit
 )
 
-:: 1. Uruchom Skaner (login.py)
-echo [1/4] Startuje Skaner (Kamera)...
-start "1. SKANER (login.py)" ".venv\Scripts\python.exe" login.py
+:: --- KROK 1: SERWER GLOWNY (Kamera) ---
+echo [1/4] Startuje Skaner (login.py)...
+start "1. LOGIN (Kamera)" ".venv\Scripts\python.exe" login.py
 
-:: Czekamy 2 sekundy, żeby kamera zdążyła się zainicjować
-timeout /t 2 /nobreak >nul
+:: Czekamy 3 sekundy, zeby Flask zdazyl wstac i zajac kamere
+timeout /t 3 /nobreak >nul
 
-:: 2. Uruchom Procesor (rotation.py)
-echo [2/4] Startuje Procesor (rotation.py)...
-start "2. PROCESOR (rotation.py)" ".venv\Scripts\python.exe" rotation.py
+:: --- KROK 2: SKRYPTY POMOCNICZE ---
 
-:: 3. Uruchom Mapper (wrapper.py)
-:: UWAGA: Na screenie plik nazywa się wrapper.py, w kodzie wcześniej był window_mapper.py.
-:: Używam nazwy ze screena.
-echo [3/4] Startuje Mapper (wrapper.py)...
-start "3. MAPPER (wrapper.py)" ".venv\Scripts\python.exe" wrapper.py
+echo [2/4] Startuje Mapper (wrapper.py)...
+start "2. WRAPPER" ".venv\Scripts\python.exe" wrapper.py
 
-:: 4. Uruchom Uploader (uploader.py)
-echo [4/4] Startuje Uploader (uploader.py)...
-start "4. UPLOADER (uploader.py)" ".venv\Scripts\python.exe" uploader.py
+echo [3/4] Startuje Uploader (uploader.py)...
+start "3. UPLOADER" ".venv\Scripts\python.exe" uploader.py
 
-echo ==========================================
-echo Wszystkie serwisy zostaly uruchomione w osobnych oknach.
-echo Nie zamykaj ich! (Minimalizuj jesli trzeba)
-echo ==========================================
+:: --- KROK 3: INTERFEJS ---
+echo [4/4] Startuje GUI (Electron)...
+if exist "gui-electron" (
+    cd gui-electron
+    start "4. GUI (Electron)" npm start
+    cd ..
+) else (
+    echo [BLAD] Nie znaleziono folderu gui-electron!
+    pause
+)
+
+echo ========================================================
+echo WSZYSTKIE MODULY URUCHOMIONE.
+echo ========================================================
+echo Aby zamknac system, zamknij okna konsoli.
 pause

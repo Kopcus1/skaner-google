@@ -1,4 +1,4 @@
+google-genai
 google-cloud-storage
 google-cloud-firestore
-google-generativeai
 functions-framework

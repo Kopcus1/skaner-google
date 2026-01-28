@@ -6,85 +6,129 @@ import time
 import sys
 import os
 import datetime
-from PIL import Image, ImageDraw, ImageFont
+import math
+import threading
+import shutil
+from flask import Flask, Response
+from flask_socketio import SocketIO
 
-# --- KONFIGURACJA OGÓLNA ---
-CAMERA_INDEX = 2
+# --- KONFIGURACJA DEBUGOWANIA ---
+sys.stdout.reconfigure(encoding='utf-8')
+
+print("=========================================")
+print("   SYSTEM WESOLA - CLEAN UI + AUTO FOCUS ")
+print("=========================================")
+
+# --- SERWER ---
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# --- KONFIGURACJA ŚCIEŻEK ---
+CURRENT_DIR = os.getcwd()
+BASE_DIR = os.path.join(CURRENT_DIR, "content")
+OUTPUT_RAW_DIR = os.path.join(BASE_DIR, "RAW_PHOTO")
+OUTPUT_CROPPED_DIR = os.path.join(BASE_DIR, "CROPPED")
+EXTRA_OUTPUT_ROOT = os.path.join(CURRENT_DIR, "full_content")
 FIREBASE_KEY_PATH = "serviceAccountKey.json"
 COLLECTION_NAME = "qr_codes"
-OUTPUT_DIR = os.path.join(os.getcwd(), "content", "RAW_PHOTO")
-
-# --- KONFIGURACJA FONTU ---
-FONT_PATH = "C:/Windows/Fonts/Arial.ttf"
-FONT_SIZE_HEADER = 32
-FONT_SIZE_NORMAL = 20
-FONT_SIZE_SMALL = 14
 
 # --- PARAMETRY ---
-BRIGHTNESS_THRESHOLD = 100
-MIN_COVERAGE_PERCENT = 5.0
-CHANGE_THRESHOLD_FOR_RESET = 10.0
-TRIGGER_TIME = 0.5
-MIN_QR_COUNT = 3
-SESSION_TIMEOUT = 181
-
-# --- LIMIT SKANÓW ---
+CAMERA_INDEX = 2
+TRIGGER_TIME = 3
+SUCCESS_DURATION = 10
+ERROR_DURATION = 10
+MIN_QR_COUNT = 4
 MAX_SCANS = 5
+SESSION_TIMEOUT = 60
+MARKER_MEMORY_DURATION = 0.2
+MAX_ABORTS_BEFORE_RESET = 5  # Ile razy można zgubić tracking zanim zresetujemy focus
 
-# UI SETTINGS
-WINDOW_NAME = "System Wesola - Skaner PRO"
-SIDEBAR_WIDTH = 400
-DISPLAY_HEIGHT = 700
+# Parametry obrazu wynikowego (High Res)
+FINAL_WIDTH = 486 * 3
+FINAL_HEIGHT = 727 * 3
 
-# WYMUSZONA ROZDZIELCZOŚĆ
-TARGET_WIDTH = 1280
-TARGET_HEIGHT = 960
+
+# --- HELPERY GEOMETRYCZNE ---
+def distance(p1, p2):
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+def estimate_missing_point(markers):
+    all_keys = ['TL', 'TR', 'BR', 'BL']
+    missing = [k for k in all_keys if k not in markers]
+    if len(missing) != 1: return markers, None
+    missing_key = missing[0]
+
+    if missing_key == 'BR':
+        new_pt = np.array(markers['BL']) + (np.array(markers['TR']) - np.array(markers['TL']))
+        markers['BR'] = tuple(new_pt)
+    elif missing_key == 'BL':
+        new_pt = np.array(markers['BR']) + (np.array(markers['TL']) - np.array(markers['TR']))
+        markers['BL'] = tuple(new_pt)
+    elif missing_key == 'TR':
+        new_pt = np.array(markers['TL']) + (np.array(markers['BR']) - np.array(markers['BL']))
+        markers['TR'] = tuple(new_pt)
+    elif missing_key == 'TL':
+        new_pt = np.array(markers['TR']) + (np.array(markers['BL']) - np.array(markers['BR']))
+        markers['TL'] = tuple(new_pt)
+    return markers, missing_key
 
 
 class SmartScanner:
     def __init__(self):
-        print(f"--- START SYSTEMU (Kamera ID: {CAMERA_INDEX}) ---")
-        print(f"--- Limit skanow: {MAX_SCANS} na uzytkownika ---")
+        print(f"[INIT] Start kamery: {CAMERA_INDEX}")
+        self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
 
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # Wysoka rozdzielczość
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 4160)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 3120)
+        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+
+        self.setup_directories()
         self.init_firestore()
-        self.init_fonts()
+        self.detector = cv2.QRCodeDetector()
 
+        # Zmienne stanu sesji
         self.current_user_id = None
-        self.current_client_name = ""  # <--- NOWA ZMIENNA NA IMIĘ
+        self.current_client_name = ""
         self.current_user_scans = 0
-
         self.last_qr_data = ""
         self.qr_cooldown = 0
         self.last_activity_time = 0
 
+        # Zmienne stanu skanowania
         self.timer_start = None
-        self.is_locked = False
-        self.capture_coverage_level = 0.0
+        self.success_timer_start = None
+        self.error_timer_start = None
+        self.scan_abort_count = 0  # Licznik przerwań skanowania (reset focusu)
 
-        self.status_text = ["ZABLOKOWANY", "Zeskanuj bilet"]
-        self.status_color = (0, 0, 255)  # BGR
-        self.ui_bg_color = (40, 40, 40)
-        self.feedback_timer = 0
-        self.progress_bar_val = 0.0
+        self.last_valid_markers = {}
+        self.marker_history = {}
 
-        self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-        if not self.cap.isOpened():
-            print(f"[BLAD] Brak kamery ID {CAMERA_INDEX}")
-            sys.exit(1)
+        self.ui_state = {
+            "status_header": "ZABLOKOWANY",
+            "status_sub": "Zeskanuj bilet",
+            "bg_color": "blue",
+            "progress": 0.0,
+            "user_name": "",
+            "scan_count": 0,
+            "max_scans": MAX_SCANS,
+            "is_logged_in": False
+        }
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    def setup_directories(self):
+        for path in [OUTPUT_RAW_DIR, OUTPUT_CROPPED_DIR, EXTRA_OUTPUT_ROOT]:
+            os.makedirs(path, exist_ok=True)
 
-        real_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        real_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-
-        if int(real_w) != TARGET_WIDTH or int(real_h) != TARGET_HEIGHT:
-            print(f"[INFO] Skalowanie programowe aktywne.")
-
-        self.detector = cv2.QRCodeDetector()
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    def remove_accents(self, text):
+        replacements = {
+            'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z',
+            'Ą': 'A', 'Ć': 'C', 'Ę': 'E', 'Ł': 'L', 'Ń': 'N', 'Ó': 'O', 'Ś': 'S', 'Ź': 'Z', 'Ż': 'Z'
+        }
+        clean_text = str(text)
+        for k, v in replacements.items():
+            clean_text = clean_text.replace(k, v)
+        return clean_text
 
     def init_firestore(self):
         try:
@@ -92,281 +136,372 @@ class SmartScanner:
                 cred = credentials.Certificate(FIREBASE_KEY_PATH)
                 firebase_admin.initialize_app(cred)
             self.db = firestore.client()
+            print("[DB] Polaczono.")
         except Exception as e:
-            print(f"[ERR] Firestore: {e}")
-            sys.exit(1)
+            print(f"[DB ERR] {e}")
 
-    def init_fonts(self):
-        """Ładuje fonty do pamięci"""
+    def update_ui(self):
+        socketio.emit('ui_update', self.ui_state)
+
+    def set_status(self, header, sub, color):
+        if (self.ui_state["status_header"] != header or
+                self.ui_state["bg_color"] != color):
+            self.ui_state.update({
+                "status_header": header,
+                "status_sub": sub,
+                "bg_color": color
+            })
+            self.update_ui()
+            safe_header = self.remove_accents(header)
+            # print(f"[UI] {safe_header} | {color}")
+
+    def trigger_focus_reset(self):
+        """Metoda uruchamiana w wątku: wymusza mechaniczny reset focusu."""
         try:
-            self.font_header = ImageFont.truetype(FONT_PATH, FONT_SIZE_HEADER)
-            self.font_normal = ImageFont.truetype(FONT_PATH, FONT_SIZE_NORMAL)
-            self.font_small = ImageFont.truetype(FONT_PATH, FONT_SIZE_SMALL)
-        except IOError:
-            print(f"[WARN] Nie znaleziono fontu {FONT_PATH}. Używam domyślnego.")
-            self.font_header = ImageFont.load_default()
-            self.font_normal = ImageFont.load_default()
-            self.font_small = ImageFont.load_default()
+            print(f"[FOCUS] Wykryto problemy ({self.scan_abort_count} przerwań). RESETOWANIE SOCZEWKI...")
 
-    def get_white_coverage(self, frame):
-        small = cv2.resize(frame, (320, 240))
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, BRIGHTNESS_THRESHOLD, 255, cv2.THRESH_BINARY)
-        white_pixels = cv2.countNonZero(mask)
-        total_pixels = small.shape[0] * small.shape[1]
-        pct = (white_pixels / total_pixels) * 100.0
-        return pct
+            # Informacja dla użytkownika (opcjonalnie, lub zostawiamy 'POZIOMUJ')
+            # self.set_status("KALIBRACJA...", "Poprawiam ostrość kamery...", "orange")
+
+            # 1. Wyłącz autofocus
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+
+            # 2. Przesuń soczewkę na pozycję 0 (Macro) - to zmusza mechanizm do ruchu
+            self.cap.set(cv2.CAP_PROP_FOCUS, 0)
+
+            # 3. Odczekaj chwilę, aż hardware zareaguje
+            time.sleep(0.3)
+
+            # 4. Włącz autofocus ponownie
+            self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+
+            # Reset licznika, żeby dać szansę kamerze na ustawienie się
+            self.scan_abort_count = 0
+            print("[FOCUS] Reset zakończony.")
+
+        except Exception as e:
+            print(f"[FOCUS ERR] Nie udało się zresetować: {e}")
+
+    # --- LOGIKA BIZNESOWA ---
 
     def get_user_data(self, uuid):
         try:
-            doc_ref = self.db.collection(COLLECTION_NAME).document(uuid)
-            doc = doc_ref.get()
+            doc = self.db.collection(COLLECTION_NAME).document(uuid).get()
             if doc.exists:
-                data = doc.to_dict()
-
-                # 1. Pobieramy licznik
-                stained_glass = data.get("StainedGlass", {})
-                scan_count = stained_glass.get("ScanCount", 0)
-
-                # 2. Pobieramy ClientName (jeśli brak, wpisujemy 'Gość')
-                client_name = data.get("ClientName", "")
-                if not client_name:
-                    client_name = "Gość"
-
-                return True, scan_count, client_name
+                d = doc.to_dict()
+                client_name = d.get("ClientName", "Gość") or "Gość"
+                return True, d.get("StainedGlass", {}).get("ScanCount", 0), client_name
             return False, 0, ""
-        except Exception as e:
-            print(f"[ERR] Błąd pobierania danych: {e}")
+        except:
             return False, 0, ""
-
-    def trigger_ui_feedback(self, mode):
-        duration = 0.5
-        if mode == "login":
-            self.ui_bg_color = (255, 0, 0)
-        elif mode == "error":
-            self.ui_bg_color = (0, 0, 255)
-        elif mode == "photo":
-            self.ui_bg_color = (0, 255, 0)
-        elif mode == "logout":
-            self.ui_bg_color = (0, 165, 255)
-            duration = 3.0
-
-        self.feedback_timer = time.time() + duration
-
-    def check_session_timeout(self):
-        if self.current_user_id:
-            elapsed = time.time() - self.last_activity_time
-            if elapsed > SESSION_TIMEOUT:
-                print(f"[AUTO-LOGOUT] Przekroczono czas {SESSION_TIMEOUT}s")
-                self.current_user_id = None
-                self.current_client_name = ""  # <--- RESET IMIENIA
-                self.status_text = ["WYLOGOWANO", "Czas minal"]
-                self.status_color = (0, 165, 255)
-                self.trigger_ui_feedback("logout")
 
     def handle_login_scan(self, qr_data):
-        curr_time = time.time()
-        if qr_data == self.last_qr_data and (curr_time - self.qr_cooldown < 2.0):
-            return
+        curr = time.time()
+        if qr_data == self.last_qr_data and (curr - self.qr_cooldown < 5.0): return
 
         self.last_qr_data = qr_data
-        self.qr_cooldown = curr_time
-
+        self.qr_cooldown = curr
         clean_uuid = qr_data.split("/")[-1].strip()
-        print(f"[LOGIN] Sprawdzam: {clean_uuid}")
+        print(f"[LOGIN] Sprawdzam UUID: {clean_uuid}")
 
-        # Pobieramy dane z nową sygnaturą funkcji (3 wartości)
-        exists, scan_count, client_name = self.get_user_data(clean_uuid)
+        exists, count, name = self.get_user_data(clean_uuid)
 
         if exists:
+            if count >= MAX_SCANS:
+                safe_name = self.remove_accents(name)
+                print(f"[LOGIN] Limit wyczerpany dla {safe_name}")
+                self.error_timer_start = time.time()
+                self.set_status("LIMIT WYCZERPANY", "Brak dostępnych skanów", "red")
+                return
+
+            self.error_timer_start = None
+            self.success_timer_start = None
+
+            # RESETUJEMY licznik błędów przy nowym logowaniu
+            self.scan_abort_count = 0
+
             self.current_user_id = clean_uuid
-            self.current_user_scans = scan_count
-            self.current_client_name = client_name  # <--- ZAPISANIE IMIENIA
+            self.current_user_scans = count
+            self.current_client_name = name
 
-            self.is_locked = False
-            self.timer_start = None
+            self.ui_state.update({
+                "user_name": name,
+                "scan_count": count,
+                "is_logged_in": True
+            })
             self.last_activity_time = time.time()
-            self.trigger_ui_feedback("login")
-            print(f"[LOGIN] Zalogowano: {client_name} ({clean_uuid}) | Skanów: {scan_count}")
+            self.set_status(f"Cześć {name}!", "Umieść rysunek pod skanerem", "green")
+
+            safe_name = self.remove_accents(name)
+            print(f"[LOGIN] Zalogowano: {safe_name}")
         else:
-            self.trigger_ui_feedback("error")
+            self.error_timer_start = time.time()
+            self.set_status("BŁĄD", "Nieznany bilet", "red")
 
-    def process_camera_logic(self, clean_frame, art_qr_count):
-        if self.current_user_scans >= MAX_SCANS:
-            self.status_text = ["LIMIT WYCZERPANY", f"Wykonano: {MAX_SCANS}/{MAX_SCANS}"]
-            self.status_color = (0, 0, 255)
-            self.progress_bar_val = 0.0
-            return
+    # --- PROCESOWANIE OBRAZU W TLE ---
 
-        current_time = time.time()
-        coverage_pct = self.get_white_coverage(clean_frame)
-        paper_detected = coverage_pct > MIN_COVERAGE_PERCENT
-
-        if self.is_locked:
-            diff = abs(coverage_pct - self.capture_coverage_level)
-            if diff > CHANGE_THRESHOLD_FOR_RESET:
-                self.is_locked = False
-                print(f"[RESET] System odblokowany")
-            else:
-                self.status_text = ["ZAPISANO!", "Zmień kartkę"]
-                self.status_color = (0, 255, 255)
-        else:
-            if paper_detected and art_qr_count >= MIN_QR_COUNT:
-                if self.timer_start is None:
-                    self.timer_start = current_time
-
-                elapsed = current_time - self.timer_start
-                self.progress_bar_val = min(elapsed / TRIGGER_TIME, 1.0)
-
-                if elapsed >= TRIGGER_TIME:
-                    self.take_photo(clean_frame, coverage_pct)
-                else:
-                    self.status_text = ["TRZYMAJ...", f"{((TRIGGER_TIME - elapsed)):.1f}s"]
-                    self.status_color = (0, 255, 0)
-            else:
-                self.timer_start = None
-                self.progress_bar_val = 0.0
-                if not paper_detected:
-                    self.status_text = ["GOTOWY", "Poloz kartke"]
-                else:
-                    self.status_text = ["POZIOMUJ...", f"QR: {art_qr_count}/3"]
-                self.status_color = (255, 255, 255)
-
-    def take_photo(self, clean_frame, coverage_pct):
-        print(f"[CAM] FOTO WYKONANE! Rozmiar: {clean_frame.shape[1]}x{clean_frame.shape[0]}")
-
-        current_scan_nr = self.current_user_scans + 1
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = f"scan_{self.current_user_id}_{current_scan_nr}_{timestamp}.jpg"
-
-        filepath = os.path.join(OUTPUT_DIR, filename)
+    def process_and_save_task(self, frame, markers, user_id, scan_nr):
+        filename = f"{user_id}_{scan_nr}.jpg"
+        print(f"[PROCESS] Rozpoczynam przetwarzanie {filename}...")
 
         try:
-            cv2.imwrite(filepath, clean_frame)
-            print(f"[DISK] Zapisano: {filename}")
+            # 1. Zapis RAW do folderu zbiorczego (backup)
+            path_raw_backup = os.path.join(OUTPUT_RAW_DIR, filename)
+            cv2.imwrite(path_raw_backup, frame)
 
-            self.current_user_scans += 1
-            user_ref = self.db.collection(COLLECTION_NAME).document(self.current_user_id)
-            user_ref.update({"StainedGlass.ScanCount": firestore.Increment(1)})
-            print(f"[CLOUD] Zaktualizowano StainedGlass.ScanCount: {self.current_user_scans}")
+            # 2. Logika geometryczna
+            required = ['TL', 'TR', 'BR', 'BL']
+            found_count = len([k for k in required if k in markers])
+            final_markers = markers.copy()
+
+            if found_count == 3:
+                final_markers, _ = estimate_missing_point(final_markers)
+            elif found_count < 3:
+                print(f"[PROCESS ERR] Za malo punktow ({found_count})")
+                return
+
+            src_pts = np.array([final_markers['TL'], final_markers['TR'], final_markers['BR'], final_markers['BL']],
+                               dtype="float32")
+
+            width_a = distance(final_markers['TL'], final_markers['TR'])
+            width_b = distance(final_markers['BL'], final_markers['BR'])
+            max_width = max(int(width_a), int(width_b))
+
+            height_a = distance(final_markers['TL'], final_markers['BL'])
+            height_b = distance(final_markers['TR'], final_markers['BR'])
+            max_height = max(int(height_a), int(height_b))
+
+            dst_pts = np.array([
+                [0, 0],
+                [max_width - 1, 0],
+                [max_width - 1, max_height - 1],
+                [0, max_height - 1]
+            ], dtype="float32")
+
+            M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+            warped_img = cv2.warpPerspective(frame, M, (max_width, max_height))
+
+            # 3. Rotacja i Resize
+            warped_img = cv2.rotate(warped_img, cv2.ROTATE_90_CLOCKWISE)
+            warped_img = cv2.resize(warped_img, (FINAL_WIDTH, FINAL_HEIGHT), interpolation=cv2.INTER_AREA)
+
+            # 4. Zapis wyników
+            # A: Zapis do folderu zbiorczego CROPPED
+            path_cropped = os.path.join(OUTPUT_CROPPED_DIR, filename)
+            cv2.imwrite(path_cropped, warped_img)
+
+            # B: Zapis do full_content (Dla Electrona / Uploader)
+            folder_name = os.path.splitext(filename)[0]
+            path_extra_dir = os.path.join(EXTRA_OUTPUT_ROOT, folder_name)
+
+            os.makedirs(path_extra_dir, exist_ok=True)
+
+            path_extra_scan = os.path.join(path_extra_dir, "scan.jpg")
+            path_extra_raw = os.path.join(path_extra_dir, "raw.jpg")
+
+            cv2.imwrite(path_extra_scan, warped_img)
+            cv2.imwrite(path_extra_raw, frame)
+
+            # 5. Aktualizacja Firestore
+            self.db.collection(COLLECTION_NAME).document(user_id) \
+                .update({"StainedGlass.ScanCount": firestore.Increment(1)})
+
+            print(f"[PROCESS OK] Zapisano w full_content: scan.jpg i raw.jpg")
 
         except Exception as e:
-            print(f"[ERR] Blad zapisu: {e}")
+            print(f"[PROCESS CRITICAL ERROR] {e}")
 
-        self.capture_coverage_level = coverage_pct
-        self.is_locked = True
-        self.timer_start = None
-        self.progress_bar_val = 0.0
+    def trigger_scan_procedure(self, frame, markers):
+        print("[PHOTO] Trigger! Uruchamiam proces w tle...")
+
+        scan_nr = self.current_user_scans + 1
+        user_id = self.current_user_id
+
+        self.current_user_scans += 1
         self.last_activity_time = time.time()
-        self.trigger_ui_feedback("photo")
+        self.scan_abort_count = 0  # Sukces! Zerujemy licznik błędów
 
-    def draw_ui(self, display_frame):
-        h, w = display_frame.shape[:2]
-        if time.time() > self.feedback_timer:
-            self.ui_bg_color = (40, 40, 40)
+        self.ui_state["scan_count"] = self.current_user_scans
 
-        # 1. Tworzymy sidebar w OpenCV
-        sidebar = np.zeros((h, SIDEBAR_WIDTH, 3), dtype=np.uint8)
-        sidebar[:] = self.ui_bg_color
+        t = threading.Thread(target=self.process_and_save_task,
+                             args=(frame.copy(), markers, user_id, scan_nr))
+        t.start()
 
-        # 2. Paski postępu w OpenCV
-        if self.progress_bar_val > 0:
-            bar_w = int((SIDEBAR_WIDTH - 40) * self.progress_bar_val)
-            cv2.rectangle(sidebar, (20, 350), (20 + bar_w, 380), (0, 255, 0), -1)
-            cv2.rectangle(sidebar, (20, 350), (SIDEBAR_WIDTH - 20, 380), (255, 255, 255), 2)
+        self.success_timer_start = time.time()
+        self.set_status("GOTOWE!", "Rysunek dodany do kolejki! Obserwuj instalację", "blue")
 
-        # 3. Konwersja Sidebar na PIL Image
-        sidebar_pil = Image.fromarray(cv2.cvtColor(sidebar, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(sidebar_pil)
+    # --- GLOWNA PETLA VIDEO ---
 
-        def bgr_to_rgb(bgr_tuple):
-            return bgr_tuple[::-1]
-
-        # --- RYSOWANIE TEKSTU (PIL) ---
-
-        # Główny status
-        draw.text((20, 70), self.status_text[0], font=self.font_header, fill=bgr_to_rgb(self.status_color))
-        draw.text((20, 120), self.status_text[1], font=self.font_normal, fill=(200, 200, 200))
-
-        if self.current_user_id:
-            # --- ZMIANA: Wyświetlanie Imienia zamiast ID ---
-            welcome_msg = f"Cześć! {self.current_client_name}"
-            draw.text((20, 230), welcome_msg, font=self.font_normal, fill=(0, 255, 0))
-
-            scans_color = (0, 255, 0) if self.current_user_scans < MAX_SCANS else (0, 0, 255)
-            scan_info = f"Skanow: {self.current_user_scans} / {MAX_SCANS}"
-            draw.text((20, 260), scan_info, font=self.font_header, fill=bgr_to_rgb(scans_color))
-
-            time_left = max(0, int(SESSION_TIMEOUT - (time.time() - self.last_activity_time)))
-            draw.text((20, 310), f"Czas sesji: {time_left}s", font=self.font_normal, fill=(200, 200, 200))
-        else:
-            draw.text((20, 230), "NIEZALOGOWANY", font=self.font_normal, fill=(100, 100, 100))
-
-        # Stopka usunięta zgodnie z życzeniem (zakomentowana w Twoim kodzie, tu usunięta wizualnie)
-
-        # 4. Konwersja powrotna PIL -> OpenCV
-        sidebar = cv2.cvtColor(np.array(sidebar_pil), cv2.COLOR_RGB2BGR)
-
-        return np.hstack((display_frame, sidebar))
-
-    def run(self):
+    def generate_frames(self):
+        print("[LOOP] Start petli...")
         while True:
+            socketio.sleep(0.01)
+
             ret, frame = self.cap.read()
-            if not ret: continue
+            if not ret:
+                time.sleep(0.5)
+                continue
 
             display_frame = frame.copy()
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            self.check_session_timeout()
+            # --- KROK 1: SUROWA DETEKCJA ---
+            found_long_codes = []
+            raw_frame_markers = {}
 
             try:
-                retval, decoded, points, _ = self.detector.detectAndDecodeMulti(frame)
-            except:
-                retval = False
+                retval, decoded, points, _ = self.detector.detectAndDecodeMulti(gray_frame)
 
-            decoded_list = decoded if retval else []
-            qr_points = points if retval else []
+                if retval:
+                    if points is not None:
+                        points = points.astype(int)
 
-            login_code_found = None
-            art_qr_count = 0
+                    for i, data in enumerate(decoded):
+                        if not data: continue
 
-            for i, data in enumerate(decoded_list):
-                if not data: continue
+                        if points is not None and len(points) > i:
+                            pts = points[i]
+                            center_x = np.mean(pts[:, 0])
+                            center_y = np.mean(pts[:, 1])
 
-                pts = qr_points[i].astype(int)
-                for j in range(4):
-                    cv2.line(display_frame, tuple(pts[j]), tuple(pts[(j + 1) % 4]), (0, 255, 0), 4)
+                            # Klasyfikacja
+                            if len(data) > 20:
+                                found_long_codes.append(data)
 
-                if len(data) > 20:
-                    login_code_found = data
-                elif "_" in data and len(data) < 10:
-                    art_qr_count += 1
+                            elif "_" in data:
+                                # ZNACZNIKI (TL, TR etc.)
+                                parts = data.split('_')
+                                pos = parts[0]
+                                if pos in ['TL', 'TR', 'BL', 'BR']:
+                                    raw_frame_markers[pos] = (center_x, center_y)
 
-            if login_code_found:
-                self.handle_login_scan(login_code_found)
+                # Obsługa logowania
+                for code in found_long_codes:
+                    self.handle_login_scan(code)
+                    break
 
+            except Exception as e:
+                pass
+
+            # --- KROK 2: STABILIZACJA (PAMIĘĆ) ---
+            current_time = time.time()
+
+            for pos, coord in raw_frame_markers.items():
+                self.marker_history[pos] = {
+                    'coord': coord,
+                    'seen': current_time
+                }
+
+            stabilized_markers = {}
+            for pos in ['TL', 'TR', 'BL', 'BR']:
+                if pos in self.marker_history:
+                    last_data = self.marker_history[pos]
+                    if current_time - last_data['seen'] < MARKER_MEMORY_DURATION:
+                        stabilized_markers[pos] = last_data['coord']
+
+            # --- OBSŁUGA BLOKAD ---
+            is_blocked = False
+
+            if self.error_timer_start:
+                if time.time() - self.error_timer_start < ERROR_DURATION:
+                    is_blocked = True
+                else:
+                    self.error_timer_start = None
+                    self.set_status("ZABLOKOWANY", "Zeskanuj bilet", "blue")
+
+            if self.success_timer_start:
+                if time.time() - self.success_timer_start < SUCCESS_DURATION:
+                    is_blocked = True
+                    self.set_status("GOTOWE!", "Rysunek dodany do kolejki! Obserwuj instalację", "blue")
+                else:
+                    self.success_timer_start = None
+                    self.current_user_id = None
+                    self.ui_state["is_logged_in"] = False
+                    self.set_status("ZABLOKOWANY", "Zeskanuj bilet", "blue")
+
+            if is_blocked:
+                try:
+                    ret, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                    yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                except:
+                    pass
+                continue
+
+            # --- LOGIKA SKANOWANIA ---
             if self.current_user_id:
-                self.process_camera_logic(frame, art_qr_count)
+                if time.time() - self.last_activity_time > SESSION_TIMEOUT:
+                    self.current_user_id = None
+                    self.ui_state["is_logged_in"] = False
+                    self.set_status("WYLOGOWANO", "Czas minął", "blue")
+                    continue
+
+                unique_markers_count = len(stabilized_markers)
+
+                if unique_markers_count >= MIN_QR_COUNT:
+                    if self.timer_start is None:
+                        self.timer_start = time.time()
+                        print(f"[TRIGGER] Start odliczania!")
+
+                    elapsed = time.time() - self.timer_start
+                    progress = min(elapsed / TRIGGER_TIME, 1.0)
+                    self.ui_state["progress"] = progress
+
+                    left = TRIGGER_TIME - elapsed
+                    self.set_status("SKANOWANIE...", f"{left:.1f}s", "green")
+                    self.update_ui()
+
+                    self.last_valid_markers = stabilized_markers.copy()
+
+                    if elapsed >= TRIGGER_TIME:
+                        self.trigger_scan_procedure(frame, self.last_valid_markers)
+                        self.timer_start = None
+                        self.ui_state["progress"] = 0.0
+                else:
+                    # --- TUTAJ JEST LOGIKA RESETU FOCUSU (WATCHDOG) ---
+
+                    # Jeśli timer był aktywny (czyli skanowaliśmy), a teraz go kasujemy -> TO JEST PRZERWANIE
+                    if self.timer_start is not None:
+                        self.timer_start = None
+                        self.ui_state["progress"] = 0.0
+                        self.set_status("POZIOMUJ...", "Zgubiono znaczniki", "orange")
+
+                        self.scan_abort_count += 1
+                        print(f"[SKAN] Przerwano! Próba: {self.scan_abort_count}/{MAX_ABORTS_BEFORE_RESET}")
+
+                        if self.scan_abort_count > MAX_ABORTS_BEFORE_RESET:
+                            # Uruchamiamy reset w tle, aby nie zamrozić podglądu
+                            threading.Thread(target=self.trigger_focus_reset).start()
+
+                    # Standardowe komunikaty statusu
+                    if unique_markers_count == 0:
+                        self.set_status(f"Cześć {self.current_client_name}!", "Połóż kartkę pod skanerem", "green")
+                    else:
+                        self.set_status("POZIOMUJ...", f"Widzę znaczników: {unique_markers_count}/4", "orange")
             else:
-                if time.time() > self.feedback_timer:
-                    self.status_text = ["ZABLOKOWANY", "Pokaz bilet"]
-                    self.status_color = (0, 0, 255)
-                self.progress_bar_val = 0.0
+                if self.ui_state["bg_color"] != "blue":
+                    self.set_status("ZABLOKOWANY", "Zeskanuj bilet", "blue")
+                    self.ui_state["is_logged_in"] = False
 
-            orig_h, orig_w = display_frame.shape[:2]
-            scale = DISPLAY_HEIGHT / orig_h
-            new_w = int(orig_w * scale)
-            preview = cv2.resize(display_frame, (new_w, DISPLAY_HEIGHT))
-
-            final_img = self.draw_ui(preview)
-            cv2.imshow(WINDOW_NAME, final_img)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        self.cap.release()
-        cv2.destroyAllWindows()
+            try:
+                ret, buffer = cv2.imencode('.jpg', display_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+                yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            except:
+                pass
 
 
-if __name__ == "__main__":
-    app = SmartScanner()
-    app.run()
+scanner = SmartScanner()
+
+
+@socketio.on('connect')
+def handle_connect():
+    print("[SOCKET] Klient polaczony.")
+    scanner.update_ui()
+
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(scanner.generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)

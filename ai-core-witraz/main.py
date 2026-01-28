@@ -2,20 +2,18 @@ import os
 import time
 import logging
 import functions_framework
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from google.cloud import storage
 from google.cloud import firestore
 
 # --- KONFIGURACJA ---
 PROJECT_ID = os.environ.get("GCP_PROJECT")
 COLLECTION_NAME = "qr_codes"
-# UWAGA: Upewnij się, że ten model jest dostępny/poprawny.
 MODEL_NAME = "gemini-3-pro-image-preview"
 
-# --- JEDEN STAŁY PROMPT ---
-# Tutaj wpisz instrukcję, która ma być stosowana do KAŻDEGO zdjęcia
-FIXED_PROMPT = """
-ROLA
+# --- PROMPT (Bezpieczny, zoptymalizowany pod brak blokad) ---
+FIXED_PROMPT = """ROLA
 Multimodalny edytor obrazu dla instalacji projection mapping.
 
 CEL
@@ -83,130 +81,159 @@ Priorytet: geometria i granice szyb > brak świata za szybą > minimum opal + du
 
 # --- INICJALIZACJA ---
 try:
-    # Klienty Google Cloud
     storage_client = storage.Client()
     db = firestore.Client(project=PROJECT_ID)
-
-    # Konfiguracja Gemini API Key
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        logging.critical("Brak zmiennej GOOGLE_API_KEY!")
+        logging.critical("Brak GOOGLE_API_KEY!")
+        ai_client = None
     else:
-        genai.configure(api_key=api_key)
-
-    # Inicjalizacja modelu
-    model = genai.GenerativeModel(MODEL_NAME)
-    logging.info(f"Model {MODEL_NAME} zainicjalizowany.")
-
+        ai_client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
+        logging.info("AI Client gotowy.")
 except Exception as e:
     logging.critical(f"Init Error: {e}")
-    model = None
+    ai_client = None
 
 
-# --- LOGIKA RETRY ---
-def generate_with_api_retry(prompt_parts):
-    delays = [0, 4, 8, 16]
-
-    for attempt, delay in enumerate(delays):
-        try:
-            if delay > 0:
-                logging.info(f"AI API: (Próba {attempt + 1}/4) Czekam {delay}s...")
-                time.sleep(delay)
-
-            return model.generate_content(prompt_parts)
-
-        except Exception as e:
-            logging.warning(f"Błąd API ({e}) w próbie {attempt + 1}.")
-            is_resource_error = "429" in str(e) or "Resource exhausted" in str(e) or "503" in str(e)
-
-            if attempt == len(delays) - 1:
-                raise e
-
-            if is_resource_error:
-                continue
-            else:
-                raise e
-
-    raise Exception("Nieoczekiwany błąd pętli retry.")
-
-
-# --- GŁÓWNA FUNKCJA (Trigger Storage) ---
 @functions_framework.cloud_event
 def process_storage_image(cloud_event):
-    """Funkcja uruchamiana automatycznie po wrzuceniu pliku do Bucketa."""
     data = cloud_event.data
     bucket_name = data["bucket"]
     file_name = data["name"]
 
-    # 1. FILTRACJA: Tylko folder input/
-    if not file_name.startswith("input/") or not file_name.endswith(('.jpg', '.png', '.jpeg')):
-        return  # Ignorujemy inne pliki
+    logging.info(f"TRIGGER DETECTED: {file_name}")
 
-    logging.info(f"--- NOWY PLIK: {file_name} ---")
+    lower_name = file_name.lower()
+    if not file_name.startswith("input/") or not lower_name.endswith(('.jpg', '.png', '.jpeg')):
+        logging.info("SKIP: Plik spoza folderu input/ lub nieprawidłowe rozszerzenie.")
+        return
+
+    # Inicjalizacja zmiennych
+    response = None
+    doc_uuid = None
+    scan_nr = 1
+    result_bytes = None  # Tu będziemy trzymać wynik
 
     try:
+        # 1. PARSOWANIE
+        base_name = os.path.basename(file_name)
+        name_without_ext = os.path.splitext(base_name)[0]
+
+        if "_" in name_without_ext:
+            parts = name_without_ext.rsplit("_", 1)
+            doc_uuid = parts[0]
+            scan_nr = int(parts[1]) if parts[1].isdigit() else 1
+        else:
+            doc_uuid = name_without_ext
+            scan_nr = 1
+
+        logging.info(f"UUID: {doc_uuid}, Scan: {scan_nr}")
+
+        # 2. POBRANIE
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_name)
-
-        # 2. POBIERANIE METADANYCH
-        blob.reload()
-        metadata = blob.metadata or {}
-
-        # pattern_id już nie wpływa na prompt, ale może być w metadanych
-        user_uuid = metadata.get("user_uuid", "unknown")
-        scan_nr = metadata.get("scan_number", "1")
-
-        logging.info(f"Metadane: User={user_uuid}, Scan={scan_nr}")
-
-        # 3. POBRANIE OBRAZU DO PAMIĘCI
         image_bytes = blob.download_as_bytes()
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
 
-        # 4. PRZYGOTOWANIE WSADU DLA AI
-        # Zawsze używamy tego samego promptu
-        text_prompt = FIXED_PROMPT
+        # 3. KONFIGURACJA
+        config = types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            candidate_count=1,
+            safety_settings=[
+                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+                types.SafetySetting(category="HARM_CATEGORY_CIVIC_INTEGRITY", threshold="BLOCK_NONE"),
+            ]
+        )
 
-        # Struktura dla google.generativeai (Prompt + Obraz)
-        image_part = {'mime_type': 'image/jpeg', 'data': image_bytes}
-        prompt_parts = [text_prompt, image_part]
+        # 4. GENEROWANIE Z PEŁNĄ LOGIKĄ RETRY (Pętla Wytrwałości)
+        max_retries = 5
 
-        # 5. GENEROWANIE
-        logging.info(f"Wysyłam do Gemini stały prompt: {text_prompt}")
-        response = generate_with_api_retry(prompt_parts)
+        for attempt in range(1, max_retries + 1):
+            try:
+                logging.info(f"--- PRÓBA GENEROWANIA {attempt}/{max_retries} ---")
 
-        # Walidacja odpowiedzi
-        if not response.parts:
-            raise Exception("AI zwróciło pustą odpowiedź (blocked?)")
+                # A. Strzał do API
+                response = ai_client.models.generate_content(
+                    model=MODEL_NAME, contents=[FIXED_PROMPT, image_part], config=config
+                )
 
-        try:
-            result_bytes = response.parts[0].inline_data.data
-        except AttributeError:
-            raise Exception(f"AI nie zwróciło obrazu. Tekst: {response.text}")
+                # B. Walidacja "na gorąco" (wewnątrz pętli)
+                if not response or not response.candidates:
+                    raise Exception("Pusta odpowiedź API (brak kandydatów).")
 
-        # 6. ZAPIS WYNIKU DO OUTPUT/
-        output_filename = f"output/{user_uuid}_{scan_nr}.png"
-        output_blob = bucket.blob(output_filename)
+                candidate = response.candidates[0]
+                finish_reason = candidate.finish_reason
 
-        output_blob.upload_from_string(result_bytes, content_type="image/png")
-        logging.info(f"Zapisano wynik: {output_filename}")
+                # Jeśli finish_reason jest zły, rzucamy błąd, żeby wpadło do except i ponowiło próbę
+                if finish_reason not in [1, "STOP", "FINISH_REASON_STOP"]:
+                    # Logujemy jako warning, ale próbujemy jeszcze raz
+                    logging.warning(f"Próba {attempt}: Blokada {finish_reason}. Safety: {candidate.safety_ratings}")
+                    raise Exception(f"Blokada AI: {finish_reason}")
 
-        # 7. AKTUALIZACJA FIRESTORE
-        if user_uuid != "unknown":
-            doc_ref = db.collection(COLLECTION_NAME).document(user_uuid)
+                # C. Wyciąganie bajtów
+                temp_bytes = None
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if part.inline_data and part.inline_data.data:
+                            temp_bytes = part.inline_data.data
+                            break
 
-            # Aktualizacja wewnątrz StainedGlass
-            doc_ref.update({
-                "StainedGlass.LastProcessedScan": scan_nr,
-                "StainedGlass.status": "ready",
-                "StainedGlass.LastUpdate": firestore.SERVER_TIMESTAMP
-            })
-            logging.info("Zaktualizowano Firestore (StainedGlass).")
+                if not temp_bytes:
+                    # Sprawdź czy to tekst
+                    err_text = "Brak obrazu."
+                    if candidate.content and candidate.content.parts:
+                        texts = [p.text for p in candidate.content.parts if p.text]
+                        if texts: err_text = f"AI zwróciło tekst: {' '.join(texts)}"
+                    raise Exception(err_text)
+
+                # D. Jeśli dotarliśmy tutaj -> SUKCES! Przerywamy pętlę.
+                result_bytes = temp_bytes
+                logging.info(f"SUKCES w próbie {attempt}. Pobrano {len(result_bytes)} bajtów.")
+                break
+
+            except Exception as e:
+                logging.warning(f"BŁĄD w próbie {attempt}: {e}")
+                # Jeśli to była ostatnia próba, rzucamy błąd dalej, żeby zapisać Error w bazie
+                if attempt == max_retries:
+                    raise Exception(f"Wyczerpano limit prób. Ostatni błąd: {e}")
+
+                # Jeśli nie ostatnia próba, czekamy chwilę (Backoff)
+                sleep_time = attempt * 3  # 3s, 6s, ...
+                time.sleep(sleep_time)
+
+        # 5. ZAPIS (Tylko jeśli mamy bytes)
+        if result_bytes:
+            output_filename = f"output/{name_without_ext}.png"
+            bucket.blob(output_filename).upload_from_string(result_bytes, content_type="image/png")
+            logging.info(f"Zapisano OUTPUT: {output_filename}")
+
+            if doc_uuid:
+                pre_mask_filename = f"pre-mask/{doc_uuid}/{name_without_ext}.png"
+                bucket.blob(pre_mask_filename).upload_from_string(result_bytes, content_type="image/png")
+
+            # 6. UPDATE DB - SUKCES
+            if doc_uuid:
+                db.collection(COLLECTION_NAME).document(doc_uuid).set({
+                    "StainedGlass": {
+                        "LastProcessedScan": scan_nr,
+                        "status": "ready",
+                        "LastUpdate": firestore.SERVER_TIMESTAMP
+                    }
+                }, merge=True)
+                logging.info("DB Update OK.")
+        else:
+            # To teoretycznie nie powinno wystąpić dzięki raise w pętli, ale dla pewności:
+            raise Exception("Nie udało się uzyskać obrazu mimo prób.")
 
     except Exception as e:
-        logging.error(f"CRITICAL FAILURE: {e}")
-        if 'user_uuid' in locals() and user_uuid != "unknown":
+        logging.error(f"CRITICAL FAILURE PO WSZYSTKICH PRÓBACH: {e}")
+        if doc_uuid:
             try:
-                db.collection(COLLECTION_NAME).document(user_uuid).update({
-                    "StainedGlass.status": "error"
-                })
-            except Exception as db_err:
-                logging.error(f"Nie udało się zapisać błędu w DB: {db_err}")
+                db.collection(COLLECTION_NAME).document(doc_uuid).set({
+                    "StainedGlass": {"status": "error", "error_msg": str(e)}
+                }, merge=True)
+            except:
+                pass

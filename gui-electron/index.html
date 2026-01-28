@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <title>Wesoła Immersive - Kiosk</title>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;600;800;900&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            /* --- KONFIGURACJA GŁÓWNA --- */
+            --bg-dark: #050505;
+            --text-main: #ffffff;
+            --accent-neon: #E20917; 
+            
+            /* --- RAMKA IDLE (MAŁA) --- */
+            --frame-w-idle: 25vw;
+            /* Wysokość wyliczona z proporcji 2181x1458 (ok. 0.6685) */
+            --frame-h-idle: calc(var(--frame-w-idle) * 0.6685);
+            --frame-bottom: 80px;
+            --frame-left: 80px;
+            
+            /* --- SIDEBAR --- */
+            --sidebar-width: 500px;
+            --c-error: #ff2a2a;
+        }
+
+        body {
+            margin: 0; padding: 0;
+            background: var(--bg-dark);
+            font-family: 'Montserrat', sans-serif;
+            overflow: hidden;
+            height: 100vh; width: 100vw;
+            color: var(--text-main);
+            transition: background 0.8s ease;
+        }
+
+        body::before {
+            content: ''; position: absolute;
+            top: -50%; right: -20%; width: 150%; height: 150%;
+            background: radial-gradient(circle, rgba(226, 9, 23, 0.08) 0%, rgba(0,0,0,0) 60%);
+            z-index: -1; pointer-events: none;
+        }
+
+        /* =========================================
+           KAMERA (RAMKA GŁÓWNA)
+           ========================================= */
+        #camera-wrapper {
+            position: absolute;
+            overflow: hidden;
+            background: #000;
+            z-index: 5;
+            aspect-ratio: 2181 / 1458;
+            transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 0 60px rgba(0,0,0,0.8);
+            border: 1px solid rgba(255,255,255,0.3);
+            border-radius: 4px;
+        }
+
+        #camera-feed {
+            width: 100%; height: 100%;
+            display: block;
+            opacity: 0.9;
+            object-fit: cover; 
+        }
+
+        /* IDLE */
+        body.state-idle #camera-wrapper {
+            width: var(--frame-w-idle);
+            height: var(--frame-h-idle);
+            bottom: var(--frame-bottom);
+            left: var(--frame-left);
+            transform: translate(0, 0);
+            top: auto; 
+        }
+
+        /* ACTIVE */
+        body.state-active #camera-wrapper {
+            height: 80vh;
+            width: auto; 
+            top: 50%;
+            left: calc((100vw - var(--sidebar-width)) / 2);
+            transform: translate(-50%, -50%);
+            bottom: auto; 
+            border-color: #ffffff;
+            box-shadow: 0 0 100px rgba(0,0,0,0.9);
+            background: radial-gradient(circle at center, rgba(40,40,40,1) 0%, rgba(5,5,5,1) 85%);
+        }
+        
+        body.state-active #camera-feed { opacity: 1; object-fit: cover; }
+
+        body.state-process #camera-wrapper,
+        body.state-error #camera-wrapper { opacity: 0; pointer-events: none; }
+
+        /* =========================================
+           UI IDLE
+           ========================================= */
+        #idle-ui {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            opacity: 0; pointer-events: none; transition: opacity 0.5s;
+            padding: 80px; box-sizing: border-box;
+        }
+        body.state-idle #idle-ui { opacity: 1; pointer-events: all; }
+
+        .top-description { display: flex; flex-direction: column; justify-content: flex-start; }
+
+        h1 {
+            font-size: 80px; margin: 0 0 30px 0; text-transform: uppercase;
+            font-weight: 900; letter-spacing: -2px; line-height: 0.9;
+            background: linear-gradient(to bottom right, #5FC4E1, #E20917);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text; color: transparent;
+        }
+
+        .main-text {
+            font-size: 20px; font-weight: 300; line-height: 1.6;
+            color: rgba(255,255,255,0.8); 
+            max-width: 1400px;
+            display: grid; grid-template-columns: 1fr 1fr; gap: 60px;
+            margin-top: 100px;
+        }
+        .main-text p { margin: 0; text-align: justify;}
+
+        .bottom-section {
+            position: absolute;
+            bottom: var(--frame-bottom);
+            left: var(--frame-left); 
+            right: var(--frame-left);
+            height: var(--frame-h-idle);
+            max-width: 1400px;
+            display: grid;
+            grid-template-columns: 1fr 1fr; 
+            gap: 60px; 
+            pointer-events: none; 
+        }
+
+        .right-instructions {
+            grid-column: 2; display: flex; flex-direction: column; 
+            justify-content: flex-start; position: relative; pointer-events: auto; 
+        }
+
+        .step-title {
+            font-size: 14px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; margin-bottom: 10px;
+            display: inline-block; width: fit-content; padding: 5px 10px;
+            background: linear-gradient(to bottom right, #5FC4E1, #E20917);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text; color: transparent;
+            border: 1px solid transparent; border-image: linear-gradient(to bottom right, #5FC4E1, #E20917); border-image-slice: 1;
+        }
+
+        .instruction-header {
+            font-size: 52px; font-weight: 800; margin: 0 0 25px 0; line-height: 1;
+            background: linear-gradient(to bottom right, #5FC4E1, #E20917);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text; color: transparent;
+        }
+        .instruction-detail { font-size: 18px; color: rgba(255,255,255,0.6); margin-bottom: 20px; max-width: 650px; line-height: 1.6; }
+
+        .arrow-wrapper { display: flex; align-items: center; margin-top: 10px; }
+        .big-arrow {
+            font-size: 50px; margin-right: 25px;
+            animation: pointLeft 2s infinite ease-in-out;
+            background: linear-gradient(to bottom right, #5FC4E1, #E20917);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text; color: transparent;
+        }
+        @keyframes pointLeft { 0%, 100% { transform: translateX(0); } 50% { transform: translateX(-15px); } }
+        .arrow-label { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; font-weight: 600; }
+
+        .controls-absolute {
+            position: absolute; bottom: 80px; right: 80px;
+            display: flex; align-items: center; z-index: 20;
+        }
+
+        .lang-btn {
+            width: 70px; height: 45px; margin-left: 25px; cursor: pointer; background: transparent; padding: 0;
+            border-radius: 16px; overflow: hidden; border: 2px solid rgba(255,255,255,0.3); opacity: 0.5; filter: grayscale(100%);
+            transform-origin: center center; transform: scale(1); transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1); box-sizing: border-box; 
+        }
+        .lang-btn img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .lang-btn:hover { opacity: 0.8; filter: grayscale(50%); border-color: white; }
+        .lang-btn.active {
+            opacity: 1; filter: grayscale(0%); transform: scale(1.2); z-index: 10;
+            border: 2px solid transparent; 
+            background: linear-gradient(#000, #000) padding-box, linear-gradient(to bottom right, #5FC4E1, #E20917) border-box;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+        }
+
+        /* =========================================
+           SIDEBAR
+           ========================================= */
+        #active-sidebar {
+            position: absolute; right: 0; top: 0; width: 500px; height: 100%;
+            background: rgba(5, 5, 5, 0.95); backdrop-filter: blur(30px);
+            border-left: 1px solid rgba(255,255,255,0.1);
+            transform: translateX(100%); transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+            z-index: 10; padding: 80px 50px; box-sizing: border-box;
+            display: flex; flex-direction: column; justify-content: space-between;
+        }
+        body.state-active #active-sidebar { transform: translateX(0); border-left-color: var(--c-active); }
+        body:not(.state-active) #active-sidebar { transform: translateX(100%); }
+
+        .status-box h1 { font-size: 48px; margin: 0; }
+        .status-box h2 { font-size: 18px; opacity: 0.6; font-weight: 400; margin-top: 15px; text-transform: uppercase; letter-spacing: 1px;}
+        .icon-box { font-size: 60px; margin-bottom: 30px; text-shadow: 0 0 20px rgba(255,255,255,0.2); }
+        .progress-track { height: 4px; background: rgba(255,255,255,0.1); margin-top: 50px; overflow: hidden; }
+        .progress-fill { height: 100%; background: var(--accent-neon); width: 0%; transition: width 0.1s linear; box-shadow: 0 0 15px var(--accent-neon); }
+        #user-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); padding: 30px; margin-top: auto; }
+
+        #success-ui, #limit-ui {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center;
+            opacity: 0; pointer-events: none; transition: opacity 0.5s ease; z-index: 20;
+            background: radial-gradient(circle at center, rgba(20,20,20,1) 0%, #000 100%);
+        }
+        
+        #limit-ui { background: radial-gradient(circle at center, rgba(100, 0, 0, 0.8) 0%, #000000 70%); }
+
+        body.state-process #success-ui, body.state-error #limit-ui { opacity: 1; pointer-events: all; }
+
+        .success-icon { font-size: 100px; color: var(--accent-neon); margin-bottom: 40px; animation: pulseSuccess 2s infinite; }
+        @keyframes pulseSuccess { 0% { transform: scale(1); opacity: 0.8; } 50% { transform: scale(1.1); opacity: 1; } 100% { transform: scale(1); opacity: 0.8; } }
+        .success-header { font-size: 90px; font-weight: 900; margin: 0; letter-spacing: -2px; background: linear-gradient(to bottom right, #5FC4E1, #E20917); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .success-sub { font-size: 24px; color: rgba(255,255,255,0.7); font-weight: 300; margin-top: 20px; max-width: 600px; line-height: 1.6; }
+        
+        .stats-container { margin-top: 80px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(10px); padding: 40px 60px; border-radius: 4px; display: flex; flex-direction: column; align-items: center; }
+        .stats-label { font-size: 14px; text-transform: uppercase; letter-spacing: 4px; opacity: 0.5; margin-bottom: 10px; }
+        .stats-count { font-size: 60px; font-weight: 700; font-family: monospace; }
+        .stats-count span { color: var(--accent-neon); }
+        .stats-limit { font-size: 30px; opacity: 0.4; }
+
+        body.state-error .stats-container { border-color: var(--c-error); background: rgba(255, 42, 42, 0.05); }
+        body.state-error .stats-count span { color: var(--c-error); }
+        .limit-icon { font-size: 100px; color: var(--c-error); margin-bottom: 40px; }
+        .limit-header { font-size: 90px; font-weight: 900; margin: 0; letter-spacing: -2px; background: linear-gradient(to right, #fff, var(--c-error)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    </style>
+</head>
+<body class="state-idle">
+
+    <div id="camera-wrapper">
+        <img id="camera-feed" src="http://localhost:5000/video_feed" onerror="this.style.display='none'" onload="this.style.display='block'" />
+    </div>
+
+    <div id="idle-ui">
+        <div class="top-description">
+            <h1 data-i18n="title">Widmowe Płótno</h1>
+            <div class="main-text">
+                <p data-i18n="desc_p1">
+                    Znajdujesz się w przestrzeni, gdzie granica między fizycznym szkicem a cyfrowym światłem przestaje istnieć. Projekt Widmowe Płótno to hołd dla tradycyjnej sztuki witrażowej, przetłumaczony na język nowoczesnych algorytmów sztucznej inteligencji. To wirtualne okno nie jest statyczną dekoracją, lecz żywą tkanką, która nieustannie zmienia się pod wpływem wyobraźni odwiedzających.                </p>
+                <p data-i18n="desc_p2">
+Twoja rola nie kończy się na obserwacji – stajesz się architektem tego miejsca. Wystarczy prosty rysunek na papierze, aby uruchomić zaawansowane procesy generatywne. W ciągu kilku chwil Twój szkic zostanie zinterpretowany przez system, przetworzony na barwną mozaikę i wpleciony w cyfrową ekspozycję, stając się częścią naszej wspólnej historii.                </p>
+            </div>
+        </div>
+        <div class="bottom-section">
+            <div></div> 
+            <div class="right-instructions">
+                <div class="step-title" data-i18n="step_1">KROK 1</div>
+                <h2 class="instruction-header" data-i18n="activate_system">AKTYWUJ SYSTEM</h2>
+                <div class="instruction-detail"><p data-i18n="instruction_text">Przygotuj bilet z kodem QR otrzymany przy wejściu. Skieruj kod w stronę obiektywu widocznego w lewym dolnym rogu ekranu.</p></div>
+                
+                <div class="arrow-wrapper">
+                    <div class="big-arrow">🡄</div>
+                    <div class="arrow-label" data-i18n="scan_area">Miejsce skanowania<br>biletu</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="controls-absolute">
+            <div class="lang-btn active" onclick="setLang('pl', this)">
+                <img src="https://flagcdn.com/w160/pl.png" alt="PL">
+            </div>
+            <div class="lang-btn" onclick="setLang('en', this)">
+                <img src="https://flagcdn.com/w160/gb.png" alt="EN">
+            </div>
+        </div>
+    </div>
+
+    <div id="active-sidebar">
+        <div class="status-box">
+            <div class="icon-box" id="status-icon">📷</div>
+            <h1 id="status-header" data-i18n="welcome">WITAJ</h1>
+            <h2 id="status-sub" data-i18n="waiting_action">Oczekiwanie na akcję...</h2>
+            <div class="progress-track" id="progress-wrapper" style="opacity: 0;">
+                <div class="progress-fill" id="progress-bar"></div>
+            </div>
+        </div>
+        <div id="user-card" style="display: none;">
+            <div style="font-size: 11px; opacity: 0.5; letter-spacing: 3px; text-transform: uppercase;" data-i18n="artist">Artysta</div>
+            <div id="user-name" style="font-size: 28px; font-weight: 700; margin: 10px 0; color: white;">Gość</div>
+            <div style="display: flex; justify-content: space-between; margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px; font-size: 14px;">
+                <span style="opacity: 0.7" data-i18n="session">SESJA</span>
+                <span style="font-family: monospace; font-size: 16px;"><b id="scan-curr" style="color: var(--accent-neon)">0</b> / 5</span>
+            </div>
+        </div>
+    </div>
+
+    <div id="success-ui">
+        <div class="success-icon">✨</div>
+        <h1 class="success-header" data-i18n="thank_you">DZIĘKUJEMY</h1>
+        <div class="success-sub" data-i18n="success_sub">Twój rysunek został pomyślnie zeskanowany i trafił do cyfrowej obróbki.<br>Za chwilę stanie się częścią instalacji.</div>
+        <div class="stats-container">
+            <div class="stats-label" data-i18n="used_scans">Wykorzystane Skany</div>
+            <div class="stats-count"><span id="success-scan-curr">1</span><span class="stats-limit">/5</span></div>
+        </div>
+    </div>
+
+    <div id="limit-ui">
+        <div class="limit-icon">⛔</div>
+        <h1 class="limit-header" data-i18n="limit_header">LIMIT WYCZERPANY</h1>
+        <div class="success-sub" data-i18n="limit_sub">Wykorzystałeś już wszystkie dostępne skany dla tego biletu.<br>Zapraszamy do oglądania wystawy.</div>
+    </div>
+
+<script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        // --- SŁOWNIK TŁUMACZEŃ ---
+        const translations = {
+            pl: {
+                title: "Widmowe Płótno",
+                desc_p1: "Znajdujesz się w przestrzeni, gdzie granica między fizycznym szkicem a cyfrowym światłem przestaje istnieć. Projekt Widmowe Płótno to hołd dla tradycyjnej sztuki witrażowej, przetłumaczony na język nowoczesnych algorytmów sztucznej inteligencji. To wirtualne okno nie jest statyczną dekoracją, lecz żywą tkanką, która nieustannie zmienia się pod wpływem wyobraźni odwiedzających.",
+                desc_p2: "Twoja rola nie kończy się na obserwacji – stajesz się architektem tego miejsca. Wystarczy prosty rysunek na papierze, aby uruchomić zaawansowane procesy generatywne. W ciągu kilku chwil Twój szkic zostanie zinterpretowany przez system, przetworzony na barwną mozaikę i wpleciony w cyfrową ekspozycję, stając się częścią naszej wspólnej historii.",
+                step_1: "KROK 1",
+                activate_system: "AKTYWUJ SYSTEM",
+                instruction_text: "Przygotuj bilet z kodem QR otrzymany przy wejściu. Skieruj kod w stronę obiektywu widocznego w lewym dolnym rogu ekranu.",
+                scan_area: "Miejsce skanowania<br>biletu",
+                welcome: "WITAJ",
+                waiting_action: "Oczekiwanie na akcję...",
+                artist: "Artysta",
+                session: "SESJA",
+                thank_you: "DZIĘKUJEMY",
+                success_sub: "Twój rysunek został pomyślnie zeskanowany i trafił do cyfrowej obróbki.<br>Za chwilę stanie się częścią instalacji.",
+                used_scans: "Wykorzystane Skany",
+                limit_header: "LIMIT WYCZERPANY",
+                limit_sub: "Wykorzystałeś już wszystkie dostępne skany dla tego biletu.<br>Zapraszamy do oglądania wystawy."
+            },
+            en: {
+                title: "Spectral Canvas",
+                desc_p1: "You are in a space where the boundary between a physical sketch and digital light ceases to exist. Project Spectral Canvas is a tribute to traditional stained glass art, translated into the language of modern artificial intelligence algorithms. This virtual window is not a static decoration, but a living fabric that constantly changes under the influence of visitors' imagination.",
+                desc_p2: "Your role does not end with observation – you become the architect of this space. A simple drawing on paper is enough to trigger advanced generative processes. In just a few moments, your sketch will be interpreted by the system, processed into a colorful mosaic, and woven into the digital exhibition, becoming part of our shared history.",
+                step_1: "STEP 1",
+                activate_system: "ACTIVATE SYSTEM",
+                instruction_text: "Prepare the ticket with the QR code received at the entrance. Point the code towards the lens visible in the bottom left corner of the screen.",
+                scan_area: "Scan area<br>for ticket",
+                welcome: "WELCOME",
+                waiting_action: "Waiting for action...",
+                artist: "Artist",
+                session: "SESSION",
+                thank_you: "THANK YOU",
+                success_sub: "Your drawing has been successfully scanned and sent for digital processing.<br>It will become part of the installation shortly.",
+                used_scans: "Used Scans",
+                limit_header: "LIMIT REACHED",
+                limit_sub: "You have used all available scans for this ticket.<br>We invite you to view the exhibition."
+            }
+        };
+
+        const serverMessages = {
+            "WITAJ": "WELCOME",
+            "GOTOWE!": "DONE!",
+            "BŁĄD": "ERROR",
+            "ZAPISANO": "SAVED",
+            "LIMIT WYCZERPANY": "LIMIT REACHED",
+            "ZABLOKOWANY": "LOCKED",
+            "SKANOWANIE...": "SCANNING...",
+            "POZIOMUJ...": "ALIGNING...",
+            "WYLOGOWANO": "LOGGED OUT",
+            "Zeskanuj bilet": "Scan your ticket",
+            "Brak dostępnych skanów": "No scans available",
+            "Nieznany bilet": "Unknown ticket",
+            "Rysunek dodany do kolejki! Obserwuj instalację": "Drawing queued! Watch the installation",
+            "Czas minął": "Session timeout",
+            "Zgubiono znaczniki": "Markers lost",
+            "Oczekiwanie na akcję...": "Waiting for action...",
+            "Połóż kartkę pod skanerem": "Place paper under scanner",
+            "Umieść rysunek pod skanerem": "Place drawing under scanner",
+            "Gość": "Guest",
+            "PRZETWARZANIE": "PROCESSING",
+            "Proszę czekać...": "Please wait..."
+        };
+
+        let currentLang = 'pl';
+
+        function setLang(lang, btn) {
+            currentLang = lang;
+            
+            document.querySelectorAll('.lang-btn').forEach(b => b.classList.remove('active'));
+            if(btn) btn.classList.add('active');
+
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+                const key = el.getAttribute('data-i18n');
+                if (translations[lang][key]) {
+                    el.innerHTML = translations[lang][key];
+                }
+            });
+            console.log("Język zmieniony na:", lang);
+        }
+
+        function translateDynamicText(text) {
+            if (currentLang === 'pl') return text; 
+            if (!text) return "";
+
+            if (serverMessages[text]) {
+                return serverMessages[text];
+            }
+
+            if (text.startsWith("Cześć ")) {
+                let namePart = text.replace("Cześć ", "").replace("!", "");
+                if (namePart === "Gość") namePart = "Guest";
+                return `Welcome ${namePart}!`;
+            }
+
+            if (text.startsWith("Widzę znaczników:")) {
+                return text.replace("Widzę znaczników:", "Markers visible:");
+            }
+
+            return text; 
+        }
+
+        const socket = io('http://localhost:5000');
+        const body = document.body;
+        
+        const header = document.getElementById('status-header');
+        const sub = document.getElementById('status-sub');
+        const icon = document.getElementById('status-icon');
+        const userCard = document.getElementById('user-card');
+        const userName = document.getElementById('user-name');
+        
+        const scanCurr = document.getElementById('scan-curr');
+        const successScanCurr = document.getElementById('success-scan-curr');
+        
+        const progressWrapper = document.getElementById('progress-wrapper');
+        const progressBar = document.getElementById('progress-bar');
+        const cameraFeed = document.getElementById('camera-feed');
+
+        socket.on('connect', () => {
+            cameraFeed.src = "http://localhost:5000/video_feed?" + new Date().getTime();
+        });
+
+        socket.on('ui_update', (data) => {
+            // 1. OBSŁUGA STATUSÓW SPECJALNYCH (BŁĄD / SUKCES)
+            if (data.status_header.includes("LIMIT") || data.status_header.includes("BŁĄD") || data.bg_color === 'red') {
+                body.className = 'state-error';
+                header.innerText = translateDynamicText(data.status_header);
+                sub.innerText = translateDynamicText(data.status_sub);
+                return;
+            }
+
+            if (data.status_header.includes("GOTOWE") || data.status_header.includes("ZAPISANO")) {
+                // --- FIX: Aktualizujemy liczniki ZANIM wyjdziemy z funkcji ---
+                // Dzięki temu na ekranie "DZIĘKUJEMY" pojawi się już zaktualizowana liczba (np. 3/5)
+                scanCurr.innerText = data.scan_count;
+                successScanCurr.innerText = data.scan_count;
+                
+                body.className = 'state-process';
+                return; // Przerywamy, aby nie nadpisać tekstu "GOTOWE"
+            }
+
+            // 2. OBSŁUGA STANDARDOWA (SKANOWANIE)
+            if (data.is_logged_in) {
+                body.className = 'state-active';
+                
+                header.innerText = translateDynamicText(data.status_header);
+                
+                if(data.status_sub === "Oczekiwanie na akcję..." && currentLang === 'en') {
+                    sub.innerText = translations['en']['waiting_action'];
+                } else {
+                    sub.innerText = translateDynamicText(data.status_sub);
+                }
+
+                userCard.style.display = 'block';
+                
+                let displayedName = data.user_name;
+                if (currentLang === 'en' && displayedName === "Gość") {
+                    displayedName = "Guest";
+                }
+                userName.innerText = displayedName;
+
+                // Aktualizacja liczników w trybie active
+                scanCurr.innerText = data.scan_count;
+                successScanCurr.innerText = data.scan_count;
+            } else {
+                body.className = 'state-idle';
+                userCard.style.display = 'none';
+            }
+
+            // 3. PASEK POSTĘPU
+            if (data.progress > 0) {
+                progressWrapper.style.opacity = '1';
+                progressBar.style.width = (data.progress * 100) + '%';
+            } else {
+                progressWrapper.style.opacity = '0';
+                progressBar.style.width = '0%';
+            }
+        });
+    </script>
+</body>
+</html>
