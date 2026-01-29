@@ -10,7 +10,7 @@ CURRENT_DIR = os.getcwd()
 BASE_DIR = os.path.join(CURRENT_DIR, "full_content")
 
 # TWÓJ KLUCZ API
-API_KEY = "AIzaSyCEPkERAcr2lHweE_7vJiqQhNUBP4GnYck"
+API_KEY = "PUT_API_KEY_HERE
 
 # Model (Dla Imagen 3 używaj gemini-2.5-flash-image lub gemini-3-pro-image-preview)
 MODEL_NAME = "gemini-3-pro-image-preview"
